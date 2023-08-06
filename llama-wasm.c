@@ -633,6 +633,7 @@ int main(int argc, char *argv[])
         checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
 #endif
     }
+
     // right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len)
     {
@@ -640,43 +641,74 @@ int main(int argc, char *argv[])
     }
 
     // read in the tokenizer.bin file
+    // read in the tokenizer.bin file
     char **vocab = (char **)malloc(config.vocab_size * sizeof(char *));
     float *vocab_scores = (float *)malloc(config.vocab_size * sizeof(float));
     unsigned int max_token_length;
+
+    unsigned char *tokenizer_data;
+    size_t tokenizer_data_size;
+#ifdef __wasi__
+    // If we are in the WASI environment, read the file using WASI APIs
+    int tokenizer_fd = open("tokenizer.bin", O_RDONLY);
+    if (tokenizer_fd < 0)
     {
-        FILE *file = fopen("tokenizer.bin", "rb");
-        if (!file)
-        {
-            printf("couldn't load tokenizer.bin\n");
-            return 1;
-        }
-        if (fread(&max_token_length, sizeof(int), 1, file) != 1)
-        {
-            printf("failed read\n");
-            return 1;
-        }
-        int len;
-        for (int i = 0; i < config.vocab_size; i++)
-        {
-            if (fread(vocab_scores + i, sizeof(float), 1, file) != 1)
-            {
-                printf("failed read\n");
-                return 1;
-            }
-            if (fread(&len, sizeof(int), 1, file) != 1)
-            {
-                printf("failed read\n");
-                return 1;
-            }
-            vocab[i] = (char *)malloc(len + 1);
-            if (fread(vocab[i], len, 1, file) != 1)
-            {
-                printf("failed read\n");
-                return 1;
-            }
-            vocab[i][len] = '\0'; // add the string terminating token
-        }
-        fclose(file);
+        printf("couldn't load tokenizer.bin\n");
+        return 1;
+    }
+    struct stat tokenizer_stat;
+    if (fstat(tokenizer_fd, &tokenizer_stat) != 0)
+    {
+        printf("couldn't get size of tokenizer.bin\n");
+        return 1;
+    }
+    tokenizer_data_size = tokenizer_stat.st_size;
+    tokenizer_data = (unsigned char *)malloc(tokenizer_data_size);
+    if (read(tokenizer_fd, tokenizer_data, tokenizer_data_size) != tokenizer_data_size)
+    {
+        printf("couldn't read tokenizer.bin\n");
+        return 1;
+    }
+    close(tokenizer_fd);
+#else
+    // If we are in a system environment, use standard C file APIs
+    FILE *file = fopen("tokenizer.bin", "rb");
+    if (!file)
+    {
+        printf("couldn't load tokenizer.bin\n");
+        return 1;
+    }
+    fseek(file, 0, SEEK_END);
+    tokenizer_data_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    tokenizer_data = (unsigned char *)malloc(tokenizer_data_size);
+    if (fread(tokenizer_data, tokenizer_data_size, 1, file) != 1)
+    {
+        printf("failed to read tokenizer.bin\n");
+        return 1;
+    }
+    fclose(file);
+#endif
+    // Now, tokenizer_data contains the data from tokenizer.bin
+    // You can use it like a regular file, but you need to manually keep track of the current position
+    // For example, to read max_token_length, you can do:
+    max_token_length = *(unsigned int *)tokenizer_data;
+    tokenizer_data += sizeof(unsigned int);
+
+    int len;
+    for (int i = 0; i < config.vocab_size; i++)
+    {
+        vocab_scores[i] = *(float *)tokenizer_data;
+        tokenizer_data += sizeof(float);
+
+        len = *(int *)tokenizer_data;
+        tokenizer_data += sizeof(int);
+
+        vocab[i] = (char *)malloc(len + 1);
+        memcpy(vocab[i], tokenizer_data, len);
+        tokenizer_data += len;
+
+        vocab[i][len] = '\0'; // add the string terminating token
     }
 
     // create and init the application RunState
@@ -746,7 +778,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // report achieved tok/s
+    // report achieved tok/counter
     long end = time_in_ms();
     printf("\nachieved tok/counter: %f\n", (steps - 1) / (double)(end - start) * 1000);
 
