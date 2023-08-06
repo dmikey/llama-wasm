@@ -8,8 +8,14 @@ Inference for Llama-2 Transformer model in pure C.
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/mman.h>
+
+#ifdef WASI
+#include <wasi/core.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
