@@ -561,6 +561,43 @@ int main(int argc, char *argv[])
     float *data = NULL; // memory mapped data pointer
     ssize_t file_size;  // size of the checkpoint file in bytes
     {
+#ifdef __wasi__
+        // For WASI, replace mmap with fread into a dynamically allocated buffer.
+        FILE *file = fopen(checkpoint, "rb");
+        if (!file)
+        {
+            printf("Couldn't open file %s\n", checkpoint);
+            return 1;
+        }
+        // Read in the config header.
+        if (fread(&config, sizeof(Config), 1, file) != 1)
+        {
+            return 1;
+        }
+        // Negative vocab size is a hacky way of signaling unshared weights. Bit yikes.
+        int shared_weights = config.vocab_size > 0 ? 1 : 0;
+        config.vocab_size = abs(config.vocab_size);
+        // Get the file size.
+        fseek(file, 0, SEEK_END);
+        file_size = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        // Read the entire file into a dynamically allocated buffer.
+        data = malloc(file_size);
+        if (!data)
+        {
+            printf("Failed to allocate memory for model weights.\n");
+            return 1;
+        }
+        if (fread(data, 1, file_size, file) != file_size)
+        {
+            printf("Failed to read model weights.\n");
+            return 1;
+        }
+        fclose(file);
+        float *weights_ptr = data + sizeof(Config) / sizeof(float);
+        checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
+#else
+        // For system, keep using mmap.
         FILE *file = fopen(checkpoint, "rb");
         if (!file)
         {
@@ -594,6 +631,7 @@ int main(int argc, char *argv[])
         }
         float *weights_ptr = data + sizeof(Config) / sizeof(float);
         checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
+#endif
     }
     // right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len)
