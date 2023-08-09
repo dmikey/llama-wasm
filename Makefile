@@ -1,7 +1,7 @@
 # choose your compiler, e.g. gcc/clang
 # example override to clang: make run CC=clang
-CC=/Users/derekanderson/wasi-sdk/bin/clang
-SYSROOT=/Users/derekanderson/wasi-sdk/share/wasi-sysroot
+CC=/wasi-sdk/bin/clang
+SYSROOT=/wasi-sdk/share/wasi-sysroot
 
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
