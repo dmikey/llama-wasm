@@ -1,5 +1,11 @@
 /*
 Inference for Llama-2 Transformer model in pure C.
+
+Example compile: (see README for more details)
+$ /var/wasi-sdk/bin/clang --sysroot=/var/wasi-sdk/share/wasi-sysroot -D_WASI_EMULATED_MMAN -lwasi-emulated-mman llama.c -o llama.wasm -O3
+
+Then run with:
+$ bls-runtime --fs-root-path=~/llama-wasm/ run.wasm stories15M.bin -- -i "Once upon a time"
 */
 
 #include <stdio.h>
@@ -8,14 +14,8 @@ Inference for Llama-2 Transformer model in pure C.
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-
-#ifdef WASI
-#include <wasi/core.h>
-#else
-#include <sys/stat.h>
 #include <unistd.h>
-#endif
+#include <sys/mman.h>
 
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
@@ -58,17 +58,24 @@ typedef struct
 
 typedef struct
 {
+    float prob;
+    int index;
+} ProbIndex; // struct used when sorting probabilities during top-p sampling
+
+typedef struct
+{
     // current wave of activations
-    float *x;      // activation at current time stamp (dim,)
-    float *xb;     // same, but inside a residual branch (dim,)
-    float *xb2;    // an additional buffer just for convenience (dim,)
-    float *hb;     // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2;    // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *q;      // query (dim,)
-    float *k;      // key (dim,)
-    float *v;      // value (dim,)
-    float *att;    // buffer for scores/attention values (n_heads, seq_len)
-    float *logits; // output logits
+    float *x;             // activation at current time stamp (dim,)
+    float *xb;            // same, but inside a residual branch (dim,)
+    float *xb2;           // an additional buffer just for convenience (dim,)
+    float *hb;            // buffer for hidden dimension in the ffn (hidden_dim,)
+    float *hb2;           // buffer for hidden dimension in the ffn (hidden_dim,)
+    float *q;             // query (dim,)
+    float *k;             // key (dim,)
+    float *v;             // value (dim,)
+    float *att;           // buffer for scores/attention values (n_heads, seq_len)
+    float *logits;        // output logits
+    ProbIndex *probindex; // buffer used in top-p sampling
     // kv cache
     float *key_cache;   // (layer, seq_len, dim)
     float *value_cache; // (layer, seq_len, dim)
@@ -87,13 +94,14 @@ void malloc_run_state(RunState *s, Config *p)
     s->v = calloc(p->dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
+    s->probindex = calloc(p->vocab_size, sizeof(ProbIndex));
     s->key_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits || !s->key_cache || !s->value_cache)
+    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits || !s->key_cache || !s->value_cache || !s->probindex)
     {
-        printf("malloc failed!\n");
-        exit(1);
+        fprintf(stderr, "malloc failed!\n");
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -109,6 +117,7 @@ void free_run_state(RunState *s)
     free(s->v);
     free(s->att);
     free(s->logits);
+    free(s->probindex);
     free(s->key_cache);
     free(s->value_cache);
 }
@@ -205,7 +214,11 @@ void softmax(float *x, int size)
 
 void matmul(float *xout, float *x, float *w, int n, int d)
 {
-    for (int i = 0; i < d; i++)
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    int i;
+#pragma omp parallel for private(i)
+    for (i = 0; i < d; i++)
     {
         float val = 0.0f;
         for (int j = 0; j < n; j++)
@@ -245,26 +258,19 @@ void transformer(int token, int pos, Config *p, RunState *s, TransformerWeights 
         matmul(s->k, s->xb, w->wk + l * dim * dim, dim, dim);
         matmul(s->v, s->xb, w->wv + l * dim * dim, dim, dim);
 
-        // apply RoPE rotation to the q and k vectors for each head
-        for (int h = 0; h < p->n_heads; h++)
+        // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
+        for (int i = 0; i < dim; i += 2)
         {
-            // get the q and k vectors for this head
-            float *q = s->q + h * head_size;
-            float *k = s->k + h * head_size;
-            // rotate q and k by the freq_cis_real and freq_cis_imag
-            for (int i = 0; i < head_size; i += 2)
-            {
-                float q0 = q[i];
-                float q1 = q[i + 1];
-                float k0 = k[i];
-                float k1 = k[i + 1];
-                float fcr = freq_cis_real_row[i / 2];
-                float fci = freq_cis_imag_row[i / 2];
-                q[i] = q0 * fcr - q1 * fci;
-                q[i + 1] = q0 * fci + q1 * fcr;
-                k[i] = k0 * fcr - k1 * fci;
-                k[i + 1] = k0 * fci + k1 * fcr;
-            }
+            float q0 = s->q[i];
+            float q1 = s->q[i + 1];
+            float k0 = s->k[i];
+            float k1 = s->k[i + 1];
+            float fcr = freq_cis_real_row[(i % head_size) / 2];
+            float fci = freq_cis_imag_row[(i % head_size) / 2];
+            s->q[i] = q0 * fcr - q1 * fci;
+            s->q[i + 1] = q0 * fci + q1 * fcr;
+            s->k[i] = k0 * fcr - k1 * fci;
+            s->k[i + 1] = k0 * fci + k1 * fcr;
         }
 
         // save key,value at this time step (pos) to our kv cache
@@ -389,8 +395,8 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
         int id = str_lookup(str_buffer, vocab, vocab_size);
         if (id == -1)
         {
-            printf("not good\n");
-            exit(1);
+            fprintf(stderr, "not good\n");
+            exit(EXIT_FAILURE);
         }
         tokens[*n_tokens] = id;
         (*n_tokens)++;
@@ -436,12 +442,14 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
 }
 
 // ----------------------------------------------------------------------------
-// utilities
+// utilities: time / rng
 
-unsigned long long counter = 0;
 long time_in_ms()
 {
-    return counter++;
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
 unsigned long long rng_seed;
@@ -458,9 +466,28 @@ float random_f32()
     return (random_u32() >> 8) / 16777216.0f;
 }
 
+// ----------------------------------------------------------------------------
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+
+int argmax(float *probabilities, int n)
+{
+    // return the index that has the highest probability
+    int max_i = 0;
+    float max_p = probabilities[0];
+    for (int i = 1; i < n; i++)
+    {
+        if (probabilities[i] > max_p)
+        {
+            max_i = i;
+            max_p = probabilities[i];
+        }
+    }
+    return max_i;
+}
+
 int sample(float *probabilities, int n)
 {
-    // sample index from probabilities, they must sum to 1
+    // sample index from probabilities (they must sum to 1!)
     float r = random_f32();
     float cdf = 0.0f;
     for (int i = 0; i < n; i++)
@@ -474,32 +501,71 @@ int sample(float *probabilities, int n)
     return n - 1; // in case of rounding errors
 }
 
-int argmax(float *v, int n)
+int compare(const void *a, const void *b)
 {
-    // return argmax of v in elements 0..n
-    int max_i = 0;
-    float max_p = v[0];
-    for (int i = 1; i < n; i++)
+    ProbIndex *a_ = (ProbIndex *)a;
+    ProbIndex *b_ = (ProbIndex *)b;
+    if (a_->prob > b_->prob)
+        return -1;
+    if (a_->prob < b_->prob)
+        return 1;
+    return 0;
+}
+
+int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex)
+{
+    // top-p sampling (or "nucleus sampling") samples from the smallest set of
+    // tokens that exceed probability topp. This way we never sample tokens that
+    // have very low probabilities and are less likely to go "off the rails".
+
+    // quicksort indices in descending order of probabilities
+    for (int i = 0; i < n; i++)
     {
-        if (v[i] > max_p)
+        probindex[i].index = i;
+        probindex[i].prob = probabilities[i];
+    }
+    qsort(probindex, n, sizeof(ProbIndex), compare);
+
+    // truncate the list where cumulative probability exceeds topp
+    float cumulative_prob = 0.0f;
+    int last_idx = 0;
+    for (int i = 0; i < n; i++)
+    {
+        cumulative_prob += probindex[i].prob;
+        if (cumulative_prob > topp)
         {
-            max_i = i;
-            max_p = v[i];
+            last_idx = i;
+            break; // we've exceeded topp by including last_idx
         }
     }
-    return max_i;
+
+    // sample from the truncated list
+    float r = random_f32() * cumulative_prob;
+    float cdf = 0.0f;
+    for (int i = 0; i <= last_idx; i++)
+    {
+        cdf += probindex[i].prob;
+        if (r < cdf)
+        {
+            return probindex[i].index;
+        }
+    }
+    return probindex[last_idx].index; // in case of rounding errors
 }
+
 // ----------------------------------------------------------------------------
+// int main
 
 void error_usage()
 {
-    printf("Usage:   run <checkpoint> [options]\n");
-    printf("Example: run model.bin -t 0.9 -n 256 -p \"Once upon a time\"\n");
-    printf("Options:\n");
-    printf("  -t <float>  temperature, default 0.9\n");
-    printf("  -s <int>    random seed, default time(NULL)\n");
-    printf("  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
-    printf("  -p <string> prompt string, default none\n");
+    fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
+    fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -t <float>  temperature, default 1.0\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off\n");
+    fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
+    fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
+    fprintf(stderr, "  -i <string> input prompt\n");
     exit(EXIT_FAILURE);
 }
 
@@ -508,7 +574,8 @@ int main(int argc, char *argv[])
 
     // default inits
     char *checkpoint = NULL;             // e.g. out/model.bin
-    float temperature = 0.9f;            // 0.0 = greedy & deterministic, 1.0 = max uncertainty
+    float temperature = 1.0f;            // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.9f;                   // top-p in nucleus sampling
     rng_seed = (unsigned int)time(NULL); // seed rng with time by default
     int steps = 256;                     // number of steps to run for
     char *prompt = NULL;                 // prompt string
@@ -542,6 +609,10 @@ int main(int argc, char *argv[])
         {
             temperature = atof(argv[i + 1]);
         }
+        else if (argv[i][1] == 'p')
+        {
+            topp = atof(argv[i + 1]);
+        }
         else if (argv[i][1] == 's')
         {
             rng_seed = atoi(argv[i + 1]);
@@ -550,7 +621,7 @@ int main(int argc, char *argv[])
         {
             steps = atoi(argv[i + 1]);
         }
-        else if (argv[i][1] == 'p')
+        else if (argv[i][1] == 'i')
         {
             prompt = argv[i + 1];
         }
@@ -558,6 +629,11 @@ int main(int argc, char *argv[])
         {
             error_usage();
         }
+    }
+    if (rng_seed == 0)
+    {
+        fprintf(stderr, "Cannot use seed=0 because of the rng alg used\n");
+        return 1;
     }
 
     // read in the model.bin file
@@ -567,47 +643,10 @@ int main(int argc, char *argv[])
     float *data = NULL; // memory mapped data pointer
     ssize_t file_size;  // size of the checkpoint file in bytes
     {
-#ifdef __wasi__
-        // For WASI, replace mmap with fread into a dynamically allocated buffer.
         FILE *file = fopen(checkpoint, "rb");
         if (!file)
         {
-            printf("Couldn't open file %s\n", checkpoint);
-            return 1;
-        }
-        // Read in the config header.
-        if (fread(&config, sizeof(Config), 1, file) != 1)
-        {
-            return 1;
-        }
-        // Negative vocab size is a hacky way of signaling unshared weights. Bit yikes.
-        int shared_weights = config.vocab_size > 0 ? 1 : 0;
-        config.vocab_size = abs(config.vocab_size);
-        // Get the file size.
-        fseek(file, 0, SEEK_END);
-        file_size = ftell(file);
-        fseek(file, 0, SEEK_SET);
-        // Read the entire file into a dynamically allocated buffer.
-        data = malloc(file_size);
-        if (!data)
-        {
-            printf("Failed to allocate memory for model weights.\n");
-            return 1;
-        }
-        if (fread(data, 1, file_size, file) != file_size)
-        {
-            printf("Failed to read model weights.\n");
-            return 1;
-        }
-        fclose(file);
-        float *weights_ptr = data + sizeof(Config) / sizeof(float);
-        checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
-#else
-        // For system, keep using mmap.
-        FILE *file = fopen(checkpoint, "rb");
-        if (!file)
-        {
-            printf("Couldn't open file %s\n", checkpoint);
+            fprintf(stderr, "Couldn't open file %s\n", checkpoint);
             return 1;
         }
         // read in the config header
@@ -626,20 +665,18 @@ int main(int argc, char *argv[])
         fd = open(checkpoint, O_RDONLY); // open in read only mode
         if (fd == -1)
         {
-            printf("open failed!\n");
+            fprintf(stderr, "open failed!\n");
             return 1;
         }
         data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED)
         {
-            printf("mmap failed!\n");
+            fprintf(stderr, "mmap failed!\n");
             return 1;
         }
         float *weights_ptr = data + sizeof(Config) / sizeof(float);
         checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
-#endif
     }
-
     // right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len)
     {
@@ -647,74 +684,43 @@ int main(int argc, char *argv[])
     }
 
     // read in the tokenizer.bin file
-    // read in the tokenizer.bin file
     char **vocab = (char **)malloc(config.vocab_size * sizeof(char *));
     float *vocab_scores = (float *)malloc(config.vocab_size * sizeof(float));
     unsigned int max_token_length;
-
-    unsigned char *tokenizer_data;
-    size_t tokenizer_data_size;
-#ifdef __wasi__
-    // If we are in the WASI environment, read the file using WASI APIs
-    int tokenizer_fd = open("tokenizer.bin", O_RDONLY);
-    if (tokenizer_fd < 0)
     {
-        printf("couldn't load tokenizer.bin\n");
-        return 1;
-    }
-    struct stat tokenizer_stat;
-    if (fstat(tokenizer_fd, &tokenizer_stat) != 0)
-    {
-        printf("couldn't get size of tokenizer.bin\n");
-        return 1;
-    }
-    tokenizer_data_size = tokenizer_stat.st_size;
-    tokenizer_data = (unsigned char *)malloc(tokenizer_data_size);
-    if (read(tokenizer_fd, tokenizer_data, tokenizer_data_size) != tokenizer_data_size)
-    {
-        printf("couldn't read tokenizer.bin\n");
-        return 1;
-    }
-    close(tokenizer_fd);
-#else
-    // If we are in a system environment, use standard C file APIs
-    FILE *file = fopen("tokenizer.bin", "rb");
-    if (!file)
-    {
-        printf("couldn't load tokenizer.bin\n");
-        return 1;
-    }
-    fseek(file, 0, SEEK_END);
-    tokenizer_data_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    tokenizer_data = (unsigned char *)malloc(tokenizer_data_size);
-    if (fread(tokenizer_data, tokenizer_data_size, 1, file) != 1)
-    {
-        printf("failed to read tokenizer.bin\n");
-        return 1;
-    }
-    fclose(file);
-#endif
-    // Now, tokenizer_data contains the data from tokenizer.bin
-    // You can use it like a regular file, but you need to manually keep track of the current position
-    // For example, to read max_token_length, you can do:
-    max_token_length = *(unsigned int *)tokenizer_data;
-    tokenizer_data += sizeof(unsigned int);
-
-    int len;
-    for (int i = 0; i < config.vocab_size; i++)
-    {
-        vocab_scores[i] = *(float *)tokenizer_data;
-        tokenizer_data += sizeof(float);
-
-        len = *(int *)tokenizer_data;
-        tokenizer_data += sizeof(int);
-
-        vocab[i] = (char *)malloc(len + 1);
-        memcpy(vocab[i], tokenizer_data, len);
-        tokenizer_data += len;
-
-        vocab[i][len] = '\0'; // add the string terminating token
+        FILE *file = fopen("tokenizer.bin", "rb");
+        if (!file)
+        {
+            fprintf(stderr, "couldn't load tokenizer.bin\n");
+            return 1;
+        }
+        if (fread(&max_token_length, sizeof(int), 1, file) != 1)
+        {
+            fprintf(stderr, "failed read\n");
+            return 1;
+        }
+        int len;
+        for (int i = 0; i < config.vocab_size; i++)
+        {
+            if (fread(vocab_scores + i, sizeof(float), 1, file) != 1)
+            {
+                fprintf(stderr, "failed read\n");
+                return 1;
+            }
+            if (fread(&len, sizeof(int), 1, file) != 1)
+            {
+                fprintf(stderr, "failed read\n");
+                return 1;
+            }
+            vocab[i] = (char *)malloc(len + 1);
+            if (fread(vocab[i], len, 1, file) != 1)
+            {
+                fprintf(stderr, "failed read\n");
+                return 1;
+            }
+            vocab[i][len] = '\0'; // add the string terminating token
+        }
+        fclose(file);
     }
 
     // create and init the application RunState
@@ -726,22 +732,22 @@ int main(int argc, char *argv[])
     int num_prompt_tokens = 0;
     if (prompt != NULL)
     {
-        prompt_tokens = (int *)malloc(config.seq_len * sizeof(int));
+        prompt_tokens = (int *)malloc(strlen(prompt) * sizeof(int));
         bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
     }
 
     // start the main loop
-    long start = 0;  // used to time our code, only initialized after first iteration
-    int next;        // will store the next token in the sequence
-    int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-    int pos = 0;     // position in the sequence
-    printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
+    long start = 0; // used to time our code, only initialized after first iteration
+    int next;       // will store the next token in the sequence
+    int token = 1;  // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+    int pos = 0;    // position in the sequence
     while (pos < steps)
     {
 
         // forward the transformer to get logits for the next token
         transformer(token, pos, &config, &state, &weights);
 
+        // advance the state state machine
         if (pos < num_prompt_tokens)
         {
             // if we are still processing the input prompt, force the next prompt token
@@ -765,28 +771,46 @@ int main(int argc, char *argv[])
                 // apply softmax to the logits to get the probabilities for next token
                 softmax(state.logits, config.vocab_size);
                 // we sample from this distribution to get the next token
-                next = sample(state.logits, config.vocab_size);
+                if (topp <= 0)
+                {
+                    // simply sample from the predicted probability distribution
+                    next = sample(state.logits, config.vocab_size);
+                }
+                else
+                {
+                    // top-p (nucleus) sampling, clamping the least likely tokens to zero
+                    next = sample_topp(state.logits, config.vocab_size, topp, state.probindex);
+                }
             }
         }
+        pos++;
 
-        // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
+        // data-dependent terminating condition: the BOS (1) token delimits sequences
+        if (next == 1)
+        {
+            break;
+        }
+
+        // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
         char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next] + 1 : vocab[next];
         printf("%s", token_str);
         fflush(stdout);
-
-        // advance forward
         token = next;
-        pos++;
-        // init our timer here because the first iteration is slow due to memmap
+
+        // init the timer here because the first iteration can be slower
         if (start == 0)
         {
             start = time_in_ms();
         }
     }
+    printf("\n");
 
-    // report achieved tok/counter
-    long end = time_in_ms();
-    printf("\nachieved tok/counter: %f\n", (steps - 1) / (double)(end - start) * 1000);
+    // report achieved tok/s (pos-1 because the timer starts after first iteration)
+    if (pos > 1)
+    {
+        long end = time_in_ms();
+        fprintf(stderr, "achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
+    }
 
     // memory and file handles cleanup
     free_run_state(&state);
