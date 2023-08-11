@@ -6,7 +6,11 @@ SYSROOT=/Users/derekanderson/wasi-sdk/share/wasi-sysroot
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
 run: main.c run.c
-	$(CC) --sysroot=$(SYSROOT)  -D_WASI_EMULATED_MMAN -lwasi-emulated-mman main.c run.c -o main.wasm -O3
+	$(CC) --sysroot=$(SYSROOT)  -D_WASI_EMULATED_MMAN -lwasi-emulated-mman main.c run.c -o llama.wasm -O3
+
+.PHONY: wasm
+wasm: main_wasm.c run.c
+	$(CC) --sysroot=$(SYSROOT)  -D_WASI_EMULATED_MMAN -lwasi-emulated-mman main_wasm.c run.c -o bls_llama.wasm -O3
 
 .PHONY: clean
 clean:
