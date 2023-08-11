@@ -569,7 +569,7 @@ void error_usage()
     exit(EXIT_FAILURE);
 }
 
-int main(int argc, char *argv[])
+int runModel(int argc, char *argv[])
 {
 
     // default inits
